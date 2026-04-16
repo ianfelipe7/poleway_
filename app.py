@@ -17,7 +17,6 @@ from io import BytesIO
 import polyline # type: ignore
 
 # Configs
-
 st.set_page_config(
     page_title="PoleWay - Análise por Rota (OSRM)",
     page_icon="📊",
@@ -26,13 +25,13 @@ st.set_page_config(
 )
 
 # Dados de Entrada
-ARQUIVO_CLIENTES = "rotas_processadas_319.xlsx"
+ARQUIVO_CLIENTES = "rotas_processadas_320.xlsx"
 ARQUIVO_TEMPO_ATENDIMENTO = "segmento.xlsx"
-ARQUIVO_VENDEDORES = "Vendedores Lat e Long.xlsx"
+ARQUIVO_VENDEDORES = "endereco.xlsx"
 ARQUIVO_FATURAMENTO = "faturamento.xlsx"
 COLUNA_ROTA = "Rota"
 
-# OSRM API
+# "OSRM" API
 OSRM_BASE_URL = "https://router.project-osrm.org"
 
 # CSS
@@ -42,7 +41,7 @@ st.markdown("""
     [data-testid="stSidebar"] { background-color: #2b2b2b !important; }
     [data-testid="stSidebar"] * { color: #ffffff !important; }
     h1, h2, h3, p { color: #1d1d1f !important; }
-    .stButton > button { background: #FF6B00 !important; color: white !important; }
+    .stButton > button { background: #FF6B00 !important; color: white !important; }b
     
     /* Metrics em preto */
     [data-testid="stMetricValue"] { color: #000000 !important; }
@@ -60,6 +59,16 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+ORDEM_DIA_SEMANA = {
+    1: 'Seg',
+    2: 'Ter',
+    3: 'Qua',
+    4: 'Qui',
+    5: 'Sex',
+    6: 'Sáb',
+    7: 'Dom',
+}
 
 CITY_COLORS = [
     '#FF0000',
@@ -80,7 +89,6 @@ CITY_COLORS = [
 ]
 
 # Funções API
-
 def testar_osrm_api():
     try:
         url = f"{OSRM_BASE_URL}/route/v1/driving/-39.3153,-7.2131;-39.3253,-7.2231"
@@ -94,7 +102,6 @@ def testar_osrm_api():
         return False
     except:
         return False
-
 
 def calcular_distancia_osrm(origem, destino):
     try:
@@ -123,7 +130,6 @@ def calcular_distancia_osrm(origem, destino):
     except Exception as e:
         return calcular_distancia_euclidiana(origem, destino)
 
-
 def calcular_distancia_euclidiana(origem, destino):
     try:
         dist_degrees = euclidean(origem, destino)
@@ -132,7 +138,6 @@ def calcular_distancia_euclidiana(origem, destino):
         return dist_km, time_min
     except:
         return 0, 0
-
 
 def obter_rota_osrm(origem, destino):
     try:
@@ -158,15 +163,11 @@ def obter_rota_osrm(origem, destino):
                     encoded_polyline = route['geometry']
                     decoded_coords = polyline.decode(encoded_polyline)
                     return [[coord[0], coord[1]] for coord in decoded_coords]
-        
-        return None
-        
+        return None        
     except Exception as e:
         return None
 
-
 # Funções Auxiliares
-
 def normalizar_cidade(nome):
     if pd.isna(nome):
         return 'DESCONHECIDA'
@@ -180,7 +181,6 @@ def normalizar_cidade(nome):
         nome = nome.replace(old, new)
     return nome
 
-
 def detectar_coluna(df, possiveis_nomes):
     for col in possiveis_nomes:
         if col in df.columns:
@@ -191,12 +191,10 @@ def detectar_coluna(df, possiveis_nomes):
                 return col
     return None
 
-
 def formatar_moeda(valor):
     if pd.isna(valor) or valor == 0:
         return "R$ 0"
     return f"R$ {valor:,.0f}".replace(',', 'X').replace('.', ',').replace('X', '.')
-
 
 @st.cache_data
 def load_faturamento():
@@ -232,10 +230,8 @@ def load_faturamento():
 def load_vendedores():
     try:
         if not os.path.exists(ARQUIVO_VENDEDORES):
-            return pd.DataFrame()
-        
+            return pd.DataFrame()        
         df = pd.read_excel(ARQUIVO_VENDEDORES, engine='openpyxl')
-        
         col_lat = detectar_coluna(df, ['latitude', 'Latitude', 'lat', 'Lat'])
         col_lon = detectar_coluna(df, ['longitude', 'Longitude', 'lon', 'Lon', 'lng', 'Lng'])
         col_rota = detectar_coluna(df, ['rota', 'Rota', 'ROTA'])
@@ -248,12 +244,9 @@ def load_vendedores():
             df = df.rename(columns={col_rota: 'Rota'})
         
         df = df[df['latitude'].notna() & df['longitude'].notna()].copy()
-        
         return df
-        
     except Exception as e:
         return pd.DataFrame()
-
 
 @st.cache_data
 def load_clientes():
@@ -277,22 +270,20 @@ def load_clientes():
             st.error(f"❌ Coluna '{COLUNA_ROTA}' não encontrada!")
             return pd.DataFrame()
         
+        col_ordem = detectar_coluna(df, ['Ordem', 'ordem', 'ORDEM'])
+        if col_ordem:
+            df['DiaSemana'] = pd.to_numeric(df[col_ordem], errors='coerce').map(ORDEM_DIA_SEMANA).fillna('INDEFINIDO')
+        else:
+            df['DiaSemana'] = 'INDEFINIDO'
+        
         col_cidade = detectar_coluna(df, ['cidade', 'Cidade', 'dsCidadeComercial', 'nmCidade', 'municipio'])
         if col_cidade:
             df['Cidade'] = df[col_cidade].apply(normalizar_cidade)
         else:
-            if 'endereco_completo' in df.columns:
-                df['Cidade'] = df['endereco_completo'].apply(
-                    lambda x: normalizar_cidade(str(x).split(',')[-2].strip()) 
-                    if pd.notna(x) and len(str(x).split(',')) >= 2 else 'DESCONHECIDA'
-                )
-            else:
-                df['Cidade'] = 'DESCONHECIDA'
+            df['Cidade'] = 'DESCONHECIDA'
         
         df = carregar_tempo_atendimento(df)
-        
         return df
-        
     except Exception as e:
         st.error(f"Erro ao carregar clientes: {e}")
         return pd.DataFrame()
@@ -301,7 +292,6 @@ def carregar_tempo_atendimento(df):
     if not os.path.exists(ARQUIVO_TEMPO_ATENDIMENTO):
         df['TempoVisita'] = 30
         return df
-    
     try:
         df_tempo = pd.read_excel(ARQUIVO_TEMPO_ATENDIMENTO, engine='openpyxl')
         
@@ -336,26 +326,20 @@ def carregar_tempo_atendimento(df):
             
     except Exception as e:
         df['TempoVisita'] = 30
-    
     return df
-
 
 def order_nearest_neighbor(clientes, start):
     if not clientes:
         return []
-    
     unvisited = clientes.copy()
     ordered = []
     current = start
-    
     while unvisited:
         nearest = min(unvisited, key=lambda c: euclidean(current, (c['latitude'], c['longitude'])))
         ordered.append(nearest)
         unvisited.remove(nearest)
         current = (nearest['latitude'], nearest['longitude'])
-    
     return ordered
-
 
 def minutos_para_hhmm(minutos):
     if pd.isna(minutos) or minutos == 0:
@@ -369,7 +353,12 @@ def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_o
     if df_rota.empty:
         return None, None
     
-    cidades_da_rota = sorted(df_rota['Cidade'].dropna().unique().tolist())
+    # Ordenar dias da semana pela chave numérica de Ordem
+    ordem_inversa = {v: k for k, v in ORDEM_DIA_SEMANA.items()}
+    dias_da_rota = sorted(
+        df_rota['DiaSemana'].dropna().unique().tolist(),
+        key=lambda d: ordem_inversa.get(d, 99)
+    )
     
     col_cliente = detectar_coluna(df_rota, ['cdCliente', 'codigo', 'Codigo', 'Cliente', 'id'])
     col_nome = detectar_coluna(df_rota, ['nmFantasia', 'nome', 'Nome', 'razao_social'])
@@ -377,13 +366,11 @@ def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_o
     resultados = []
     todos_clientes = []
     
-    for idx, cidade in enumerate(cidades_da_rota):
-        df_cidade = df_rota[df_rota['Cidade'] == cidade].copy()
-        
-        if df_cidade.empty:
+    for idx, dia in enumerate(dias_da_rota):
+        df_dia = df_rota[df_rota['DiaSemana'] == dia].copy()
+        if df_dia.empty:
             continue
-        
-        clientes = df_cidade.to_dict('records')
+        clientes = df_dia.to_dict('records')
         clientes_ordenados = order_nearest_neighbor(clientes, vendor_home)
         
         km_total = 0
@@ -392,19 +379,20 @@ def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_o
         
         cor = CITY_COLORS[idx % len(CITY_COLORS)]
         
-        # Buscar faturamento da cidade
-        faturamento_cidade = 0
-        if not df_faturamento_cidades.empty:
+        # Buscar faturamento agregado das cidades deste dia
+        faturamento_dia = 0
+        if not df_faturamento_cidades.empty and 'Cidade' in df_dia.columns:
+            cidades_do_dia = df_dia['Cidade'].dropna().unique().tolist()
             fat_filtro = df_faturamento_cidades[
-                (df_faturamento_cidades['Rota'] == rota_num) & 
-                (df_faturamento_cidades['Cidade'] == cidade)
+                (df_faturamento_cidades['Rota'] == rota_num) &
+                (df_faturamento_cidades['Cidade'].isin(cidades_do_dia))
             ]
             if not fat_filtro.empty:
-                faturamento_cidade = fat_filtro['Faturamento'].iloc[0]
+                faturamento_dia = fat_filtro['Faturamento'].sum()
         
         for i, cli in enumerate(clientes_ordenados):
             cli['cor'] = cor
-            cli['cidade_display'] = cidade.title()
+            cli['cidade_display'] = dia
             cli['ordem'] = i + 1
             cli['cod_cliente'] = cli.get(col_cliente, '') if col_cliente else ''
             cli['nome_cliente'] = cli.get(col_nome, '') if col_nome else ''
@@ -427,13 +415,13 @@ def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_o
                 tempo_desloc += tempo
         
         resultados.append({
-            'Cidades': cidade.title(),
+            'Cidades': dia,
             'Clientes': len(clientes_ordenados),
             'KM': round(km_total, 1),
             'Atend.': int(round(tempo_atend)),
             'Desloc.': int(round(tempo_desloc)),
             'Total': int(round(tempo_atend + tempo_desloc)),
-            'Faturamento': faturamento_cidade,
+            'Faturamento': faturamento_dia,
             'cor': cor
         })
         
@@ -515,7 +503,7 @@ def criar_mapa(clientes, vendor_home, rota_num, nome_vendedor="", usar_rotas_osr
             <div style="min-width: 200px;">
                 <h4 style="color: {cor}; margin: 0 0 8px 0;">🏷️ {codigo}</h4>
                 <p style="margin: 2px 0;"><b>Nome:</b> {nome}</p>
-                <p style="margin: 2px 0;"><b>Cidade:</b> {cidade}</p>
+                <p style="margin: 2px 0;"><b>Dia:</b> {cidade}</p>
                 <p style="margin: 2px 0;"><b>Ordem visita:</b> {ordem}</p>
                 <hr>
                 <p style="font-size: 10px; color: #666;">
@@ -535,9 +523,7 @@ def criar_mapa(clientes, vendor_home, rota_num, nome_vendedor="", usar_rotas_osr
                 popup=folium.Popup(popup_html, max_width=300),
                 tooltip=f"{ordem}. {codigo} - {cidade}"
             ).add_to(m)
-    
     return m
-
 
 # Exportar Reltório HTML
 def gerar_html_relatorio(dados_rotas, incluir_mapas=True):  
@@ -834,7 +820,6 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
     
     # Adicionar cada rota
     for rota in dados_rotas:
-        # Gerar HTML do mapa se disponível
         mapa_html = ""
         if incluir_mapas and 'mapa' in rota and rota['mapa'] is not None:
             try:
@@ -892,7 +877,7 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
                         <table>
                             <thead>
                                 <tr>
-                                    <th>Cidade</th>
+                                    <th>Dia</th>
                                     <th>Clientes</th>
                                     <th>KM</th>
                                     <th>Atend.</th>
@@ -906,12 +891,13 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
         
         # Linhas da tabela
         for _, row in rota['tabela'].iterrows():
-            is_total = row['Cidades'] == 'TOTAL'
+            is_total = row.get('Dia', row.get('Cidades', '')) == 'TOTAL'
             row_class = 'total-row' if is_total else ''
+            first_col = row.get('Dia', row.get('Cidades', ''))
             
             html += f"""
                         <tr class="{row_class}">
-                            <td>{row['Cidades']}</td>
+                            <td>{first_col}</td>
                             <td>{row['Clientes']}</td>
                             <td>{row['KM']}</td>
                             <td>{row['Atend.']}</td>
@@ -955,8 +941,7 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
     </div>
 </body>
 </html>
-"""
-    
+"""   
     return html
 
 
@@ -1051,7 +1036,7 @@ def main():
             if df_rota.empty:
                 continue
             
-            # Alterar para Coordenada do Vendedor!
+            # Alterar para Coordenada do Vendedor
             vendor_home = (-7.2131, -39.3153)  
             nome_vendedor = "Não definido"
             
@@ -1094,10 +1079,9 @@ def main():
                 st_folium(mapa, width=500, height=400, key=f"map_{rota_num}", returned_objects=[])
             
             with col2:
-                # Tabela
                 df_tabela = df_resultado[['Cidades', 'Clientes', 'KM', 'Atend.', 'Desloc.', 'Total', 'Faturamento']].copy()
+                df_tabela = df_tabela.rename(columns={'Cidades': 'Dia'})
                 
-                # Totais
                 total_clientes_tab = df_tabela['Clientes'].sum()
                 total_km = df_tabela['KM'].sum()
                 total_atend = df_tabela['Atend.'].sum()
@@ -1105,10 +1089,8 @@ def main():
                 total_geral = df_tabela['Total'].sum()
                 total_faturamento = df_tabela['Faturamento'].sum()
                 
-                # Formatar KM com 1 casa decimal
                 df_tabela['KM'] = df_tabela['KM'].apply(lambda x: f"{x:.1f}")
 
-                # Converter para HH:MM
                 df_tabela['Atend.'] = df_tabela['Atend.'].apply(minutos_para_hhmm)
                 df_tabela['Desloc.'] = df_tabela['Desloc.'].apply(minutos_para_hhmm)
                 df_tabela['Total'] = df_tabela['Total'].apply(minutos_para_hhmm)
@@ -1117,7 +1099,7 @@ def main():
                 df_tabela['Faturamento'] = df_tabela['Faturamento'].apply(formatar_moeda)
                 
                 total = {
-                    'Cidades': 'TOTAL',
+                    'Dia': 'TOTAL',
                     'Clientes': total_clientes_tab,
                     'KM': f"{total_km:.1f}",
                     'Atend.': minutos_para_hhmm(total_atend),
@@ -1128,7 +1110,7 @@ def main():
                 df_tabela = pd.concat([df_tabela, pd.DataFrame([total])], ignore_index=True)
                 
                 def style_table(row):
-                    if row['Cidades'] == 'TOTAL':
+                    if row['Dia'] == 'TOTAL':
                         return ['background-color: #FFC629; font-weight: bold; color: black'] * len(row)
                     return [''] * len(row)
                 

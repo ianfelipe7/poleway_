@@ -25,10 +25,13 @@ st.set_page_config(
 )
 
 # Dados de Entrada
-ARQUIVO_CLIENTES = "rotas_processadas_320.xlsx"
-ARQUIVO_TEMPO_ATENDIMENTO = "segmento.xlsx"
-ARQUIVO_VENDEDORES = "endereco.xlsx"
-ARQUIVO_FATURAMENTO = "faturamento.xlsx"
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
+ARQUIVO_CLIENTES          = os.path.join(_DIR, "rotas_processadas_320.xlsx")
+ARQUIVO_TEMPO_ATENDIMENTO = os.path.join(_DIR, "segmento.xlsx")
+ARQUIVO_VENDEDORES        = os.path.join(_DIR, "endereco.xlsx")
+ARQUIVO_FATURAMENTO       = os.path.join(_DIR, "faturamento.xlsx")
+ARQUIVO_PERNOITES         = os.path.join(_DIR, "pernoites.xlsx")
 COLUNA_ROTA = "Rota"
 
 # "OSRM" API
@@ -196,6 +199,95 @@ def formatar_moeda(valor):
         return "R$ 0"
     return f"R$ {valor:,.0f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NOVO: Carrega tabela de pernoites
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data
+def _load_pernoites_raw():
+    """Carrega e processa pernoites.xlsx. Separado do st.* para compatibilidade com cache."""
+    if not os.path.exists(ARQUIVO_PERNOITES):
+        return {}, None
+    try:
+        df = pd.read_excel(ARQUIVO_PERNOITES, engine='openpyxl')
+        df.columns = [c.strip().lower() for c in df.columns]
+        df['rota']      = pd.to_numeric(df['rota'],      errors='coerce')
+        df['dia']       = pd.to_numeric(df['dia'],       errors='coerce')
+        # Remove aspas extras que o Excel pode gerar nas coordenadas (ex: '"-3.5690"')
+        df['latitude']  = pd.to_numeric(df['latitude'].astype(str).str.replace('"', '', regex=False).str.strip(), errors='coerce')
+        df['longitude'] = pd.to_numeric(df['longitude'].astype(str).str.replace('"', '', regex=False).str.strip(), errors='coerce')
+        df = df.dropna(subset=['rota', 'dia', 'latitude', 'longitude'])
+
+        resultado = {}
+        for rota_num, grp in df.groupby('rota'):
+            grp = grp.sort_values('dia')
+            rota_info = {}
+
+            inicio_row = grp[grp['ponto'].str.lower() == 'inicio']
+            inicio_coords = None
+            if not inicio_row.empty:
+                r = inicio_row.iloc[0]
+                desc = f"{r.get('cidade','')}" + (f" - {r.get('hotel','')}" if r.get('hotel') else "")
+                inicio_coords = (float(r['latitude']), float(r['longitude']), desc.strip(' -'))
+
+            pernoites = grp[grp['ponto'].str.lower() == 'pernoite'].sort_values('dia')
+            dias_ordenados = sorted(pernoites['dia'].unique())
+
+            for i, dia in enumerate(dias_ordenados):
+                p = pernoites[pernoites['dia'] == dia].iloc[0]
+                desc_p = f"{p.get('cidade','')}" + (f" - {p.get('hotel','')}" if p.get('hotel') else "")
+                termino_coords = (float(p['latitude']), float(p['longitude']), desc_p.strip(' -'))
+
+                if i == 0:
+                    ini = inicio_coords if inicio_coords else termino_coords
+                else:
+                    dia_anterior = dias_ordenados[i - 1]
+                    ini = rota_info[dia_anterior]['termino']
+
+                rota_info[dia] = {'inicio': ini, 'termino': termino_coords}
+
+            resultado[rota_num] = rota_info
+        return resultado, None
+    except Exception as e:
+        return {}, str(e)
+
+
+def load_pernoites():
+    """Wrapper que exibe erros via st.* (não pode ficar dentro do cache)."""
+    dados, erro = _load_pernoites_raw()
+    if erro:
+        st.error(f"❌ Erro ao carregar pernoites: {erro}")
+    if not dados:
+        # Debug: mostrar conteúdo bruto do arquivo
+        try:
+            import openpyxl # type: ignore 
+            wb = openpyxl.load_workbook(ARQUIVO_PERNOITES, read_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(max_row=5, values_only=True))
+            st.info(f"🔍 Debug pernoites — colunas: `{rows[0] if rows else 'vazio'}`")
+            for r in rows[1:]:
+                st.caption(str(r))
+        except Exception as e2:
+            st.error(f"❌ Não foi possível abrir o arquivo: {e2}")
+    return dados
+
+
+def get_coordenadas_dia(pernoites_rota, dia_num):
+    """
+    Retorna (inicio_coords, termino_coords) para um dia específico de uma rota.
+    inicio_coords  = (lat, lon, descricao)
+    termino_coords = (lat, lon, descricao)
+    Retorna (None, None) se não houver dados.
+    """
+    if not pernoites_rota:
+        return None, None
+    # dia_num aqui é o número inteiro (1=Seg, 2=Ter, ...)
+    if dia_num in pernoites_rota:
+        info = pernoites_rota[dia_num]
+        return info['inicio'], info['termino']
+    return None, None
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 @st.cache_data
 def load_faturamento():
     try:
@@ -273,8 +365,10 @@ def load_clientes():
         col_ordem = detectar_coluna(df, ['Ordem', 'ordem', 'ORDEM'])
         if col_ordem:
             df['DiaSemana'] = pd.to_numeric(df[col_ordem], errors='coerce').map(ORDEM_DIA_SEMANA).fillna('INDEFINIDO')
+            df['DiaNum']    = pd.to_numeric(df[col_ordem], errors='coerce')  # ← guarda número do dia
         else:
             df['DiaSemana'] = 'INDEFINIDO'
+            df['DiaNum']    = np.nan
         
         col_cidade = detectar_coluna(df, ['cidade', 'Cidade', 'dsCidadeComercial', 'nmCidade', 'municipio'])
         if col_cidade:
@@ -329,6 +423,7 @@ def carregar_tempo_atendimento(df):
     return df
 
 def order_nearest_neighbor(clientes, start):
+    """Ordena clientes pelo vizinho mais próximo partindo de 'start'."""
     if not clientes:
         return []
     unvisited = clientes.copy()
@@ -348,38 +443,71 @@ def minutos_para_hhmm(minutos):
     mins = int(minutos % 60)
     return f"{horas:02d}:{mins:02d}"
 
-# Funções de Rota
-def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_osrm=True, progress_callback=None):    
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNÇÕES DE ROTA (com pernoites integrados)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades,
+                  pernoites_data, usar_osrm=True, progress_callback=None):
+    """
+    Analisa a rota considerando:
+      - Início de cada dia vindo do pernoites_.xlsx
+      - A partir do 2º dia (Ter+), o início = término do dia anterior
+      - Fluxo por dia: início_dia → clientes ordenados → término_dia
+      - Distâncias incluem: início→1ºcliente, inter-clientes, último cliente→término
+    """
     if df_rota.empty:
         return None, None
-    
-    # Ordenar dias da semana pela chave numérica de Ordem
+
+    # Mapa invertido para obter número do dia a partir da sigla
     ordem_inversa = {v: k for k, v in ORDEM_DIA_SEMANA.items()}
+
     dias_da_rota = sorted(
         df_rota['DiaSemana'].dropna().unique().tolist(),
         key=lambda d: ordem_inversa.get(d, 99)
     )
-    
+
     col_cliente = detectar_coluna(df_rota, ['cdCliente', 'codigo', 'Codigo', 'Cliente', 'id'])
-    col_nome = detectar_coluna(df_rota, ['nmFantasia', 'nome', 'Nome', 'razao_social'])
-    
-    resultados = []
+    col_nome    = detectar_coluna(df_rota, ['nmFantasia', 'nome', 'Nome', 'razao_social'])
+
+    resultados   = []
     todos_clientes = []
-    
+
+    # Pernoites desta rota (pode ser vazio)
+    pernoites_rota = pernoites_data.get(rota_num, {})
+
     for idx, dia in enumerate(dias_da_rota):
+        dia_num = ordem_inversa.get(dia, None)
+
         df_dia = df_rota[df_rota['DiaSemana'] == dia].copy()
         if df_dia.empty:
             continue
+
         clientes = df_dia.to_dict('records')
-        clientes_ordenados = order_nearest_neighbor(clientes, vendor_home)
-        
-        km_total = 0
-        tempo_atend = 0
-        tempo_desloc = 0
-        
         cor = CITY_COLORS[idx % len(CITY_COLORS)]
-        
-        # Buscar faturamento agregado das cidades deste dia
+
+        # ── Determinar coordenadas de início e término do dia ──────────────
+        inicio_coords, termino_coords = get_coordenadas_dia(pernoites_rota, dia_num)
+
+        # Fallback: usa vendor_home se não houver dado de pernoite
+        if inicio_coords is None:
+            inicio_coords = (vendor_home[0], vendor_home[1], 'Base do vendedor')
+        if termino_coords is None:
+            termino_coords = (vendor_home[0], vendor_home[1], 'Base do vendedor')
+
+        inicio_latlon  = (inicio_coords[0],  inicio_coords[1])
+        termino_latlon = (termino_coords[0], termino_coords[1])
+        # ──────────────────────────────────────────────────────────────────
+
+        # Ordenar clientes partindo do ponto de início do dia
+        clientes_ordenados = order_nearest_neighbor(clientes, inicio_latlon)
+
+        km_total   = 0.0
+        tempo_atend  = 0.0
+        tempo_desloc = 0.0
+
+        # Faturamento do dia
         faturamento_dia = 0
         if not df_faturamento_cidades.empty and 'Cidade' in df_dia.columns:
             cidades_do_dia = df_dia['Cidade'].dropna().unique().tolist()
@@ -389,116 +517,205 @@ def analisar_rota(df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_o
             ]
             if not fat_filtro.empty:
                 faturamento_dia = fat_filtro['Faturamento'].sum()
-        
+
+        # Enriquecer cada cliente
         for i, cli in enumerate(clientes_ordenados):
-            cli['cor'] = cor
+            cli['cor']            = cor
             cli['cidade_display'] = dia
-            cli['ordem'] = i + 1
-            cli['cod_cliente'] = cli.get(col_cliente, '') if col_cliente else ''
-            cli['nome_cliente'] = cli.get(col_nome, '') if col_nome else ''
-            
+            cli['ordem']          = i + 1
+            cli['cod_cliente']    = cli.get(col_cliente, '') if col_cliente else ''
+            cli['nome_cliente']   = cli.get(col_nome, '')    if col_nome    else ''
+            cli['inicio_dia']     = inicio_coords   # guarda para o mapa
+            cli['termino_dia']    = termino_coords  # guarda para o mapa
+
             tempo_visita = cli.get('TempoVisita', 30)
             if pd.isna(tempo_visita) or tempo_visita == 0:
                 tempo_visita = 30
             tempo_atend += float(tempo_visita)
-            
-            if i < len(clientes_ordenados) - 1:
-                origem = (cli['latitude'], cli['longitude'])
-                destino = (clientes_ordenados[i+1]['latitude'], clientes_ordenados[i+1]['longitude'])
-                
-                if usar_osrm:
-                    dist, tempo = calcular_distancia_osrm(origem, destino)
-                else:
-                    dist, tempo = calcular_distancia_euclidiana(origem, destino)
-                
-                km_total += dist
-                tempo_desloc += tempo
-        
+
+        # ── Calcular distâncias: início→clientes→término ──────────────────
+        # 1) início do dia → 1º cliente
+        if clientes_ordenados:
+            orig = inicio_latlon
+            dest = (clientes_ordenados[0]['latitude'], clientes_ordenados[0]['longitude'])
+            if usar_osrm:
+                d, t = calcular_distancia_osrm(orig, dest)
+            else:
+                d, t = calcular_distancia_euclidiana(orig, dest)
+            km_total     += d
+            tempo_desloc += t
+
+        # 2) Entre clientes consecutivos
+        for i in range(len(clientes_ordenados) - 1):
+            orig = (clientes_ordenados[i]['latitude'],     clientes_ordenados[i]['longitude'])
+            dest = (clientes_ordenados[i+1]['latitude'],   clientes_ordenados[i+1]['longitude'])
+            if usar_osrm:
+                d, t = calcular_distancia_osrm(orig, dest)
+            else:
+                d, t = calcular_distancia_euclidiana(orig, dest)
+            km_total     += d
+            tempo_desloc += t
+
+        # 3) Último cliente → término do dia
+        if clientes_ordenados:
+            orig = (clientes_ordenados[-1]['latitude'], clientes_ordenados[-1]['longitude'])
+            dest = termino_latlon
+            if usar_osrm:
+                d, t = calcular_distancia_osrm(orig, dest)
+            else:
+                d, t = calcular_distancia_euclidiana(orig, dest)
+            km_total     += d
+            tempo_desloc += t
+        # ──────────────────────────────────────────────────────────────────
+
         resultados.append({
-            'Cidades': dia,
-            'Clientes': len(clientes_ordenados),
-            'KM': round(km_total, 1),
-            'Atend.': int(round(tempo_atend)),
-            'Desloc.': int(round(tempo_desloc)),
-            'Total': int(round(tempo_atend + tempo_desloc)),
+            'Cidades':     dia,
+            'Clientes':    len(clientes_ordenados),
+            'KM':          round(km_total, 1),
+            'Atend.':      int(round(tempo_atend)),
+            'Desloc.':     int(round(tempo_desloc)),
+            'Total':       int(round(tempo_atend + tempo_desloc)),
             'Faturamento': faturamento_dia,
-            'cor': cor
+            'cor':         cor
         })
-        
+
         todos_clientes.extend(clientes_ordenados)
-    
+
     df_resultado = pd.DataFrame(resultados)
-    
     return df_resultado, todos_clientes
 
-# Mapa
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAPA (com marcadores de início e término por dia)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def criar_mapa(clientes, vendor_home, rota_num, nome_vendedor="", usar_rotas_osrm=True):
-    
     if not clientes:
         m = folium.Map(location=[-7.2, -39.3], zoom_start=9, tiles='CartoDB positron')
         return m
-    
+
     lats = [c['latitude'] for c in clientes] + [vendor_home[0]]
     lons = [c['longitude'] for c in clientes] + [vendor_home[1]]
     center = [sum(lats)/len(lats), sum(lons)/len(lons)]
-    
+
     m = folium.Map(location=center, zoom_start=10, tiles='CartoDB positron')
-    
-    folium.Marker(
-        location=vendor_home,
-        popup=f"🏠 <b>Vendedor Rota {rota_num}</b><br>{nome_vendedor}",
-        tooltip=f"Vendedor - {nome_vendedor}",
-        icon=folium.Icon(color='darkblue', icon='home', prefix='fa')
-    ).add_to(m)
-    
+
+    # Agrupa clientes por dia
     por_cidade = {}
     for c in clientes:
         cidade = c.get('cidade_display', 'N/A')
         if cidade not in por_cidade:
             por_cidade[cidade] = []
         por_cidade[cidade].append(c)
-    
+
+    dias_ja_marcados_inicio  = set()
+    dias_ja_marcados_termino = set()
+
     for cidade, lista in por_cidade.items():
         lista = sorted(lista, key=lambda x: x.get('ordem', 0))
-        cor = lista[0].get('cor', '#999')
-        
-        if len(lista) > 1:
-            for i in range(len(lista) - 1):
-                origem = lista[i]
-                destino = lista[i + 1]
-                
-                origem_coords = (origem['latitude'], origem['longitude'])
-                destino_coords = (destino['latitude'], destino['longitude'])
-                
-                rota_coords = None
-                
-                if usar_rotas_osrm:
-                    rota_coords = obter_rota_osrm(origem_coords, destino_coords)
-                
-                if rota_coords and len(rota_coords) > 1:
-                    folium.PolyLine(
-                        rota_coords, 
-                        color=cor, 
-                        weight=5, 
-                        opacity=0.9,
-                        tooltip=f"{cidade}: {origem.get('cod_cliente', '')} → {destino.get('cod_cliente', '')}"
-                    ).add_to(m)
-                else:
-                    folium.PolyLine(
-                        [[origem['latitude'], origem['longitude']], 
-                         [destino['latitude'], destino['longitude']]], 
-                        color=cor, 
-                        weight=3, 
-                        opacity=0.5,
-                        dash_array='5, 10',
-                        tooltip=f"{cidade} (linha reta)"
-                    ).add_to(m)
-        
+        cor   = lista[0].get('cor', '#999')
+
+        inicio_coords  = lista[0].get('inicio_dia')   # (lat, lon, desc)
+        termino_coords = lista[0].get('termino_dia')  # (lat, lon, desc)
+
+        # ── Marcador de INÍCIO do dia ──────────────────────────────────────
+        if inicio_coords and cidade not in dias_ja_marcados_inicio:
+            ini_lat, ini_lon = inicio_coords[0], inicio_coords[1]
+            ini_desc = inicio_coords[2] if len(inicio_coords) > 2 else ''
+            folium.Marker(
+                location=[ini_lat, ini_lon],
+                popup=folium.Popup(
+                    f"<b>🟢 Início — {cidade}</b><br>{ini_desc}", max_width=250
+                ),
+                tooltip=f"▶ Início {cidade}: {ini_desc}",
+                icon=folium.Icon(color='green', icon='play', prefix='fa')
+            ).add_to(m)
+            dias_ja_marcados_inicio.add(cidade)
+
+        # ── Rota: início → 1º cliente ──────────────────────────────────────
+        if inicio_coords and lista:
+            ini_coords_tuple = (inicio_coords[0], inicio_coords[1])
+            pri_coords_tuple = (lista[0]['latitude'], lista[0]['longitude'])
+            rota_ini = None
+            if usar_rotas_osrm:
+                rota_ini = obter_rota_osrm(ini_coords_tuple, pri_coords_tuple)
+            if rota_ini and len(rota_ini) > 1:
+                folium.PolyLine(
+                    rota_ini, color=cor, weight=4, opacity=0.7,
+                    dash_array='8, 6',
+                    tooltip=f"{cidade}: Início → 1º cliente"
+                ).add_to(m)
+            else:
+                folium.PolyLine(
+                    [list(ini_coords_tuple), [lista[0]['latitude'], lista[0]['longitude']]],
+                    color=cor, weight=3, opacity=0.5, dash_array='5, 10',
+                    tooltip=f"{cidade}: Início → 1º cliente (reta)"
+                ).add_to(m)
+
+        # ── Rotas entre clientes ───────────────────────────────────────────
+        for i in range(len(lista) - 1):
+            origem  = lista[i]
+            destino = lista[i + 1]
+            ori_c = (origem['latitude'],  origem['longitude'])
+            des_c = (destino['latitude'], destino['longitude'])
+
+            rota_coords = None
+            if usar_rotas_osrm:
+                rota_coords = obter_rota_osrm(ori_c, des_c)
+
+            if rota_coords and len(rota_coords) > 1:
+                folium.PolyLine(
+                    rota_coords, color=cor, weight=5, opacity=0.9,
+                    tooltip=f"{cidade}: {origem.get('cod_cliente','')} → {destino.get('cod_cliente','')}"
+                ).add_to(m)
+            else:
+                folium.PolyLine(
+                    [[origem['latitude'], origem['longitude']],
+                     [destino['latitude'], destino['longitude']]],
+                    color=cor, weight=3, opacity=0.5, dash_array='5, 10',
+                    tooltip=f"{cidade} (linha reta)"
+                ).add_to(m)
+
+        # ── Rota: último cliente → término ────────────────────────────────
+        if termino_coords and lista:
+            ult_coords_tuple = (lista[-1]['latitude'], lista[-1]['longitude'])
+            ter_coords_tuple = (termino_coords[0], termino_coords[1])
+            rota_ter = None
+            if usar_rotas_osrm:
+                rota_ter = obter_rota_osrm(ult_coords_tuple, ter_coords_tuple)
+            if rota_ter and len(rota_ter) > 1:
+                folium.PolyLine(
+                    rota_ter, color=cor, weight=4, opacity=0.7,
+                    dash_array='8, 6',
+                    tooltip=f"{cidade}: Último cliente → Término"
+                ).add_to(m)
+            else:
+                folium.PolyLine(
+                    [list(ult_coords_tuple), list(ter_coords_tuple)],
+                    color=cor, weight=3, opacity=0.5, dash_array='5, 10',
+                    tooltip=f"{cidade}: Último cliente → Término (reta)"
+                ).add_to(m)
+
+        # ── Marcador de TÉRMINO do dia ────────────────────────────────────
+        if termino_coords and cidade not in dias_ja_marcados_termino:
+            ter_lat, ter_lon = termino_coords[0], termino_coords[1]
+            ter_desc = termino_coords[2] if len(termino_coords) > 2 else ''
+            folium.Marker(
+                location=[ter_lat, ter_lon],
+                popup=folium.Popup(
+                    f"<b>🔴 Término — {cidade}</b><br>{ter_desc}", max_width=250
+                ),
+                tooltip=f"⏹ Término {cidade}: {ter_desc}",
+                icon=folium.Icon(color='red', icon='stop', prefix='fa')
+            ).add_to(m)
+            dias_ja_marcados_termino.add(cidade)
+
+        # ── Marcadores dos clientes ────────────────────────────────────────
         for cli in lista:
             codigo = cli.get('cod_cliente', '')
-            nome = cli.get('nome_cliente', '')
-            ordem = cli.get('ordem', '')
-            
+            nome   = cli.get('nome_cliente', '')
+            ordem  = cli.get('ordem', '')
+
             popup_html = f"""
             <div style="min-width: 200px;">
                 <h4 style="color: {cor}; margin: 0 0 8px 0;">🏷️ {codigo}</h4>
@@ -512,7 +729,7 @@ def criar_mapa(clientes, vendor_home, rota_num, nome_vendedor="", usar_rotas_osr
                 </p>
             </div>
             """
-            
+
             folium.CircleMarker(
                 location=[cli['latitude'], cli['longitude']],
                 radius=8,
@@ -523,19 +740,19 @@ def criar_mapa(clientes, vendor_home, rota_num, nome_vendedor="", usar_rotas_osr
                 popup=folium.Popup(popup_html, max_width=300),
                 tooltip=f"{ordem}. {codigo} - {cidade}"
             ).add_to(m)
+
     return m
 
-# Exportar Reltório HTML
+
+# Exportar Relatório HTML
 def gerar_html_relatorio(dados_rotas, incluir_mapas=True):  
     data_geracao = datetime.now().strftime("%d/%m/%Y %H:%M")
     
-    # Calcular totais gerais
     qtd_rotas = len(dados_rotas)
     total_geral_clientes = sum(r['total_clientes'] for r in dados_rotas) / qtd_rotas if qtd_rotas > 0 else 0
     total_geral_km = sum(r['total_km'] for r in dados_rotas) / qtd_rotas if qtd_rotas > 0 else 0
     total_geral_tempo = sum(r['total_tempo'] for r in dados_rotas) / qtd_rotas if qtd_rotas > 0 else 0
     
-    # Calcular média geral de faturamento
     soma_faturamentos = sum(r.get('media_faturamento_rota', 0) for r in dados_rotas)
     media_geral_faturamento = soma_faturamentos / qtd_rotas if qtd_rotas > 0 else 0
     
@@ -547,240 +764,43 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PoleWay - Relatório de Rotas (OSRM)</title>
     <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-            line-height: 1.6;
-        }}
-        
-        .container {{
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }}
-        
-        .header {{
-            background: linear-gradient(135deg, #D50037, #FF6B00);
-            color: white;
-            padding: 30px;
-            border-radius: 10px;
-            margin-bottom: 30px;
-            text-align: center;
-        }}
-        
-        .header h1 {{
-            font-size: 2rem;
-            margin-bottom: 10px;
-        }}
-        
-        .header .subtitle {{
-            font-size: 1rem;
-            opacity: 0.9;
-        }}
-        
-        .resumo-geral {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }}
-        
-        .card-resumo {{
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            text-align: center;
-        }}
-        
-        .card-resumo .valor {{
-            font-size: 2rem;
-            font-weight: bold;
-            color: #D50037;
-        }}
-        
-        .card-resumo .label {{
-            font-size: 0.9rem;
-            color: #666;
-            margin-top: 5px;
-        }}
-        
-        .rota-section {{
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            margin-bottom: 30px;
-            overflow: hidden;
-        }}
-        
-        .rota-header {{
-            background: linear-gradient(135deg, #D50037, #FF6B00);
-            color: white;
-            padding: 15px 20px;
-            font-size: 1.2rem;
-            font-weight: bold;
-        }}
-        
-        .rota-content {{
-            padding: 20px;
-        }}
-        
-        .rota-info {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-            padding: 15px;
-            background: #f8f9fa;
-            border-radius: 8px;
-        }}
-        
-        .rota-info-item {{
-            text-align: center;
-        }}
-        
-        .rota-info-item .valor {{
-            font-size: 1.5rem;
-            font-weight: bold;
-            color: #333;
-        }}
-        
-        .rota-info-item .label {{
-            font-size: 0.8rem;
-            color: #666;
-        }}
-        
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }}
-        
-        th, td {{
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid #eee;
-        }}
-        
-        th {{
-            background: #f8f9fa;
-            font-weight: 600;
-            color: #333;
-        }}
-        
-        tr:hover {{
-            background: #f8f9fa;
-        }}
-        
-        tr.total-row {{
-            background: #FFC629 !important;
-            font-weight: bold;
-        }}
-        
-        tr.total-row td {{
-            border-bottom: none;
-        }}
-        
-        .legenda {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 15px;
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #eee;
-        }}
-        
-        .legenda-item {{
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 0.9rem;
-        }}
-        
-        .legenda-cor {{
-            width: 14px;
-            height: 14px;
-            border-radius: 50%;
-        }}
-        
-        .rota-layout {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
-        }}
-        
-        .mapa-container {{
-            height: 400px;
-            border-radius: 8px;
-            overflow: hidden;
-            border: 1px solid #ddd;
-        }}
-        
-        .mapa-container iframe {{
-            width: 100%;
-            height: 100%;
-            border: none;
-        }}
-        
-        .tabela-container {{
-            overflow-x: auto;
-        }}
-        
-        @media (max-width: 900px) {{
-            .rota-layout {{
-                grid-template-columns: 1fr;
-            }}
-        }}
-        
-        .footer {{
-            text-align: center;
-            padding: 20px;
-            color: #666;
-            font-size: 0.85rem;
-        }}
-        
-        .osrm-badge {{
-            background: #4CAF50;
-            color: white;
-            padding: 5px 10px;
-            border-radius: 5px;
-            font-size: 0.85rem;
-            display: inline-block;
-            margin-left: 10px;
-        }}
-        
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
+        .header {{ background: linear-gradient(135deg, #D50037, #FF6B00); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }}
+        .header h1 {{ font-size: 2rem; margin-bottom: 10px; }}
+        .header .subtitle {{ font-size: 1rem; opacity: 0.9; }}
+        .resumo-geral {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .card-resumo {{ background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }}
+        .card-resumo .valor {{ font-size: 2rem; font-weight: bold; color: #D50037; }}
+        .card-resumo .label {{ font-size: 0.9rem; color: #666; margin-top: 5px; }}
+        .rota-section {{ background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; overflow: hidden; }}
+        .rota-header {{ background: linear-gradient(135deg, #D50037, #FF6B00); color: white; padding: 15px 20px; font-size: 1.2rem; font-weight: bold; }}
+        .rota-content {{ padding: 20px; }}
+        .rota-info {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; }}
+        .rota-info-item {{ text-align: center; }}
+        .rota-info-item .valor {{ font-size: 1.5rem; font-weight: bold; color: #333; }}
+        .rota-info-item .label {{ font-size: 0.8rem; color: #666; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #eee; }}
+        th {{ background: #f8f9fa; font-weight: 600; color: #333; }}
+        tr:hover {{ background: #f8f9fa; }}
+        tr.total-row {{ background: #FFC629 !important; font-weight: bold; }}
+        tr.total-row td {{ border-bottom: none; }}
+        .legenda {{ display: flex; flex-wrap: wrap; gap: 15px; margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee; }}
+        .legenda-item {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }}
+        .legenda-cor {{ width: 14px; height: 14px; border-radius: 50%; }}
+        .rota-layout {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
+        .mapa-container {{ height: 400px; border-radius: 8px; overflow: hidden; border: 1px solid #ddd; }}
+        .mapa-container iframe {{ width: 100%; height: 100%; border: none; }}
+        .tabela-container {{ overflow-x: auto; }}
+        @media (max-width: 900px) {{ .rota-layout {{ grid-template-columns: 1fr; }} }}
+        .footer {{ text-align: center; padding: 20px; color: #666; font-size: 0.85rem; }}
+        .osrm-badge {{ background: #4CAF50; color: white; padding: 5px 10px; border-radius: 5px; font-size: 0.85rem; display: inline-block; margin-left: 10px; }}
         @media print {{
-            body {{
-                background: white;
-            }}
-            
-            .rota-section {{
-                break-inside: avoid;
-                page-break-inside: avoid;
-            }}
-            
-            .header {{
-                -webkit-print-color-adjust: exact;
-                print-color-adjust: exact;
-            }}
-            
-            .rota-header {{
-                -webkit-print-color-adjust: exact;
-                print-color-adjust: exact;
-            }}
-            
-            tr.total-row {{
-                -webkit-print-color-adjust: exact;
-                print-color-adjust: exact;
-            }}
+            body {{ background: white; }}
+            .rota-section {{ break-inside: avoid; page-break-inside: avoid; }}
+            .header, .rota-header, tr.total-row {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
         }}
     </style>
 </head>
@@ -818,7 +838,6 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
         </div>
 """
     
-    # Adicionar cada rota
     for rota in dados_rotas:
         mapa_html = ""
         if incluir_mapas and 'mapa' in rota and rota['mapa'] is not None:
@@ -834,75 +853,41 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
             </div>
             <div class="rota-content">
                 <div class="rota-info">
-                    <div class="rota-info-item">
-                        <div class="valor">{rota['total_clientes']}</div>
-                        <div class="label">Clientes</div>
-                    </div>
-                    <div class="rota-info-item">
-                        <div class="valor">{rota['total_km']:.1f} km</div>
-                        <div class="label">Distância</div>
-                    </div>
-                    <div class="rota-info-item">
-                        <div class="valor">{minutos_para_hhmm(rota['total_atend'])}</div>
-                        <div class="label">Atendimento</div>
-                    </div>
-                    <div class="rota-info-item">
-                        <div class="valor">{minutos_para_hhmm(rota['total_desloc'])}</div>
-                        <div class="label">Deslocamento</div>
-                    </div>
-                    <div class="rota-info-item">
-                        <div class="valor">{minutos_para_hhmm(rota['total_tempo'])}</div>
-                        <div class="label">Tempo Total</div>
-                    </div>
-                    <div class="rota-info-item">
-                        <div class="valor">{formatar_moeda(rota.get('media_faturamento_rota', 0))}</div>
-                        <div class="label">Faturamento</div>
-                    </div>
+                    <div class="rota-info-item"><div class="valor">{rota['total_clientes']}</div><div class="label">Clientes</div></div>
+                    <div class="rota-info-item"><div class="valor">{rota['total_km']:.1f} km</div><div class="label">Distância</div></div>
+                    <div class="rota-info-item"><div class="valor">{minutos_para_hhmm(rota['total_atend'])}</div><div class="label">Atendimento</div></div>
+                    <div class="rota-info-item"><div class="valor">{minutos_para_hhmm(rota['total_desloc'])}</div><div class="label">Deslocamento</div></div>
+                    <div class="rota-info-item"><div class="valor">{minutos_para_hhmm(rota['total_tempo'])}</div><div class="label">Tempo Total</div></div>
+                    <div class="rota-info-item"><div class="valor">{formatar_moeda(rota.get('media_faturamento_rota', 0))}</div><div class="label">Faturamento</div></div>
                 </div>
-                
                 <div class="rota-layout">
 """
         
-        # Adicionar mapa se disponível
         if mapa_html:
             html += f"""
-                    <div class="mapa-container">
-                        {mapa_html}
-                    </div>
+                    <div class="mapa-container">{mapa_html}</div>
 """
         
-        # Tabela
         html += """
                     <div class="tabela-container">
                         <table>
                             <thead>
                                 <tr>
-                                    <th>Dia</th>
-                                    <th>Clientes</th>
-                                    <th>KM</th>
-                                    <th>Atend.</th>
-                                    <th>Desloc.</th>
-                                    <th>Total</th>
-                                    <th>Faturamento</th>
+                                    <th>Dia</th><th>Clientes</th><th>KM</th>
+                                    <th>Atend.</th><th>Desloc.</th><th>Total</th><th>Faturamento</th>
                                 </tr>
                             </thead>
                             <tbody>
 """
         
-        # Linhas da tabela
         for _, row in rota['tabela'].iterrows():
-            is_total = row.get('Dia', row.get('Cidades', '')) == 'TOTAL'
+            is_total  = row.get('Dia', row.get('Cidades', '')) == 'TOTAL'
             row_class = 'total-row' if is_total else ''
             first_col = row.get('Dia', row.get('Cidades', ''))
-            
             html += f"""
                         <tr class="{row_class}">
-                            <td>{first_col}</td>
-                            <td>{row['Clientes']}</td>
-                            <td>{row['KM']}</td>
-                            <td>{row['Atend.']}</td>
-                            <td>{row['Desloc.']}</td>
-                            <td>{row['Total']}</td>
+                            <td>{first_col}</td><td>{row['Clientes']}</td><td>{row['KM']}</td>
+                            <td>{row['Atend.']}</td><td>{row['Desloc.']}</td><td>{row['Total']}</td>
                             <td>{row['Faturamento']}</td>
                         </tr>
 """
@@ -912,11 +897,9 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
                         </table>
                     </div>
                 </div>
-                
                 <div class="legenda">
 """
         
-        # Legenda de cores
         for _, row in rota['resultado'].iterrows():
             if row['Clientes'] > 0:
                 html += f"""
@@ -941,11 +924,13 @@ def gerar_html_relatorio(dados_rotas, incluir_mapas=True):
     </div>
 </body>
 </html>
-"""   
+"""
     return html
 
 
-# Front End Interface
+# ─────────────────────────────────────────────────────────────────────────────
+# FRONT END
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     st.markdown("# 📊 Análise de Rotas Dinâmica (OSRM)")
     st.markdown("**Com OSRM API (Open Source Routing Machine) - Gratuito e Open Source**")
@@ -954,6 +939,7 @@ def main():
     df_clientes = load_clientes()
     df_vendedores = load_vendedores()
     df_faturamento_rotas, df_faturamento_cidades = load_faturamento()
+    pernoites_data = load_pernoites()   # ← NOVO
     
     osrm_ok = testar_osrm_api()
     
@@ -976,6 +962,14 @@ def main():
             st.info(f"📊 {len(df_faturamento_rotas)} rotas com dados")
         else:
             st.warning("⚠️ Faturamento não disponível")
+
+        # Status dos pernoites
+        if pernoites_data:
+            st.success(f"✅ Pernoites carregados ({len(pernoites_data)} rotas)")
+        else:
+            st.warning(f"⚠️ pernoites.xlsx não encontrado – usando base do vendedor")
+            st.caption(f"Caminho esperado: {ARQUIVO_PERNOITES}")
+            st.caption(f"Arquivo existe: {os.path.exists(ARQUIVO_PERNOITES)}")
         
         st.info("🌍 **OSRM** - Roteamento gratuito e open source")
         
@@ -996,7 +990,6 @@ def main():
         st.markdown("---")
         analisar = st.button("📊 Analisar", use_container_width=True, type="primary")
     
-    # Inicializar session_state para dados das rotas
     if 'dados_rotas_exportar' not in st.session_state:
         st.session_state.dados_rotas_exportar = []
     
@@ -1004,14 +997,11 @@ def main():
         st.session_state.dados_rotas_exportar = []
         
         total_clientes = len(df_clientes)
-        total_rotas = len(rotas_disponiveis)
+        total_rotas    = len(rotas_disponiveis)
         
         if not df_faturamento_rotas.empty:
             rotas_com_fat = df_faturamento_rotas[df_faturamento_rotas['Rota'].isin(rotas_selecionadas)]
-            if not rotas_com_fat.empty:
-                media_geral_fat = rotas_com_fat['Faturamento'].mean()
-            else:
-                media_geral_fat = 0
+            media_geral_fat = rotas_com_fat['Faturamento'].mean() if not rotas_com_fat.empty else 0
         else:
             media_geral_fat = 0
         
@@ -1023,21 +1013,19 @@ def main():
         
         st.markdown("---")
         
-        # Progress bar
         progress = st.progress(0)
-        status = st.empty()
+        status   = st.empty()
         
         for i, rota_num in enumerate(sorted(rotas_selecionadas)):
             progress.progress((i + 1) / len(rotas_selecionadas))
             status.text(f"Processando Rota {int(rota_num)}...")
             
             df_rota = df_clientes[df_clientes['ROTA'] == rota_num].copy()
-            
             if df_rota.empty:
                 continue
             
-            # Alterar para Coordenada do Vendedor
-            vendor_home = (-7.2131, -39.3153)  
+            # Coordenada base do vendedor (fallback)
+            vendor_home  = (-7.2131, -39.3153)
             nome_vendedor = "Não definido"
             
             if not df_vendedores.empty and 'Rota' in df_vendedores.columns:
@@ -1055,7 +1043,8 @@ def main():
                     media_faturamento_rota = fat_rota['Faturamento'].iloc[0]
             
             df_resultado, clientes = analisar_rota(
-                df_rota, rota_num, vendor_home, df_faturamento_cidades, usar_osrm
+                df_rota, rota_num, vendor_home,
+                df_faturamento_cidades, pernoites_data, usar_osrm   # ← passa pernoites
             )
             
             if df_resultado is None or df_resultado.empty:
@@ -1065,13 +1054,12 @@ def main():
             if total_clientes_rota == 0:
                 continue
             
-            # Header
             st.markdown(
-                f'<div class="rota-header">🚚 Rota {int(rota_num)} - {total_clientes_rota} clientes | 👤 {nome_vendedor} | 💰 {formatar_moeda(media_faturamento_rota)}</div>', 
+                f'<div class="rota-header">🚚 Rota {int(rota_num)} - {total_clientes_rota} clientes | '
+                f'👤 {nome_vendedor} | 💰 {formatar_moeda(media_faturamento_rota)}</div>',
                 unsafe_allow_html=True
             )
             
-            # Layout
             col1, col2 = st.columns([1, 1])
             
             with col1:
@@ -1083,31 +1071,28 @@ def main():
                 df_tabela = df_tabela.rename(columns={'Cidades': 'Dia'})
                 
                 total_clientes_tab = df_tabela['Clientes'].sum()
-                total_km = df_tabela['KM'].sum()
-                total_atend = df_tabela['Atend.'].sum()
-                total_desloc = df_tabela['Desloc.'].sum()
-                total_geral = df_tabela['Total'].sum()
-                total_faturamento = df_tabela['Faturamento'].sum()
+                total_km           = df_tabela['KM'].sum()
+                total_atend        = df_tabela['Atend.'].sum()
+                total_desloc       = df_tabela['Desloc.'].sum()
+                total_geral_tab    = df_tabela['Total'].sum()
+                total_faturamento  = df_tabela['Faturamento'].sum()
                 
-                df_tabela['KM'] = df_tabela['KM'].apply(lambda x: f"{x:.1f}")
-
+                df_tabela['KM']     = df_tabela['KM'].apply(lambda x: f"{x:.1f}")
                 df_tabela['Atend.'] = df_tabela['Atend.'].apply(minutos_para_hhmm)
-                df_tabela['Desloc.'] = df_tabela['Desloc.'].apply(minutos_para_hhmm)
-                df_tabela['Total'] = df_tabela['Total'].apply(minutos_para_hhmm)
-                
-                # Formatar faturamento
+                df_tabela['Desloc.']= df_tabela['Desloc.'].apply(minutos_para_hhmm)
+                df_tabela['Total']  = df_tabela['Total'].apply(minutos_para_hhmm)
                 df_tabela['Faturamento'] = df_tabela['Faturamento'].apply(formatar_moeda)
                 
-                total = {
+                total_row = {
                     'Dia': 'TOTAL',
                     'Clientes': total_clientes_tab,
                     'KM': f"{total_km:.1f}",
                     'Atend.': minutos_para_hhmm(total_atend),
                     'Desloc.': minutos_para_hhmm(total_desloc),
-                    'Total': minutos_para_hhmm(total_geral),
+                    'Total': minutos_para_hhmm(total_geral_tab),
                     'Faturamento': formatar_moeda(total_faturamento)
                 }
-                df_tabela = pd.concat([df_tabela, pd.DataFrame([total])], ignore_index=True)
+                df_tabela = pd.concat([df_tabela, pd.DataFrame([total_row])], ignore_index=True)
                 
                 def style_table(row):
                     if row['Dia'] == 'TOTAL':
@@ -1121,10 +1106,19 @@ def main():
                 cores_html = ""
                 for _, row in df_resultado.iterrows():
                     if row['Clientes'] > 0:
-                        cores_html += f'<span style="display:inline-block;width:12px;height:12px;background:{row["cor"]};border-radius:50%;margin-right:5px;"></span>{row["Cidades"]} '
+                        cores_html += (
+                            f'<span style="display:inline-block;width:12px;height:12px;'
+                            f'background:{row["cor"]};border-radius:50%;margin-right:5px;"></span>'
+                            f'{row["Cidades"]} '
+                        )
                 st.markdown(cores_html, unsafe_allow_html=True)
+
+                # Legenda de marcadores de início/término
+                st.markdown(
+                    "🟢 = Início do dia &nbsp;&nbsp; 🔴 = Término/Pernoite",
+                    unsafe_allow_html=True
+                )
             
-            # Salvar dados para exportação
             st.session_state.dados_rotas_exportar.append({
                 'numero': int(rota_num),
                 'vendedor': nome_vendedor,
@@ -1132,7 +1126,7 @@ def main():
                 'total_km': total_km,
                 'total_atend': total_atend,
                 'total_desloc': total_desloc,
-                'total_tempo': total_geral,
+                'total_tempo': total_geral_tab,
                 'media_faturamento_rota': media_faturamento_rota,
                 'tabela': df_tabela,
                 'resultado': df_resultado,
@@ -1145,7 +1139,7 @@ def main():
         status.empty()
         st.success("✅ Análise concluída!")
     
-    # Botão de exportar
+    # Exportar
     if st.session_state.dados_rotas_exportar:
         st.markdown("### 📥 Exportar Relatório")
         
@@ -1153,7 +1147,6 @@ def main():
         
         with col1:
             html_com_mapas = gerar_html_relatorio(st.session_state.dados_rotas_exportar, incluir_mapas=True)
-            
             st.download_button(
                 label="🗺️ HTML com Mapas",
                 data=html_com_mapas,
@@ -1165,7 +1158,6 @@ def main():
         
         with col2:
             html_sem_mapas = gerar_html_relatorio(st.session_state.dados_rotas_exportar, incluir_mapas=False)
-            
             st.download_button(
                 label="📄 HTML sem Mapas",
                 data=html_sem_mapas,
@@ -1180,7 +1172,6 @@ def main():
     elif not analisar:
         st.info("👆 Clique em **Analisar** para processar as rotas")
         
-        # Infos
         st.markdown("### 📋 Dados Carregados")
         col1, col2 = st.columns(2)
         
@@ -1200,6 +1191,12 @@ def main():
                 st.write(f"**Faturamento:** {len(df_faturamento_rotas)} rotas")
             else:
                 st.write("⚠️ Faturamento não carregado")
+
+            # Info de pernoites
+            if pernoites_data:
+                st.write(f"**Pernoites:** {len(pernoites_data)} rotas configuradas")
+            else:
+                st.write("⚠️ Pernoites não carregados")
 
 if __name__ == "__main__":
     main()
